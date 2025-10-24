@@ -12,14 +12,8 @@ Usage:
   Train the model:
     python this_script.py train
 
-  Train the model using a specific folder:
-    python this_script.py train -f /path/to/training_images
-  
-  Run prediction on a random image from the default folder:
+  Run prediction:
     python this_script.py predict
-
-  Run prediction on a specific image:
-    python this_script.py predict -i /path/to/my_image.jpg
 """
 
 import os
@@ -27,34 +21,37 @@ import cv2
 import numpy as np
 from skimage.feature import local_binary_pattern
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
 import joblib
 import random
 import argparse
 import sys
 
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.neighbors import LocalOutlierFactor
+from skimage.feature import graycomatrix, graycoprops
+
 # --- Configuration ---
-# An 8x8 grid on an 800x600 image.
 GRID_W = 100  # 800 / 8
 GRID_H = 75   # 600 / 8
 TARGET_ASPECT_RATIO = 4.0 / 3.0
-
-# LBP parameters
 LBP_RADIUS = 1
 LBP_POINTS = 8 * LBP_RADIUS
-
-# File paths
 MODEL_PATH = "wildlife_detector_model.pkl"
 DEFAULT_IMAGE_FOLDER = "images"
 
-# --- Common Helper Functions ---
+# --- 💡 CHOOSE YOUR ANOMALY DETECTION MODEL ---
+# Options: 'iso_forest', 'one_class_svm', 'lof'
+MODEL_TO_USE = 'lof' 
+# ==========================================
+
+
+# --- Common Helper Functions (Unchanged) ---
 
 def process_image(path: str) -> np.ndarray | None:
     """
     Loads an image, enforces 4:3 aspect ratio by center-cropping,
     and resizes to exactly 800x600.
-    
-    Returns the BGR image or None if the image is invalid or too small.
     """
     img = cv2.imread(path)
     if img is None:
@@ -64,57 +61,77 @@ def process_image(path: str) -> np.ndarray | None:
     h, w, _ = img.shape
     current_aspect_ratio = w / h
     
-    # 1. Enforce 4:3 aspect ratio by center-cropping
     if not np.isclose(current_aspect_ratio, TARGET_ASPECT_RATIO):
-        if current_aspect_ratio > TARGET_ASPECT_RATIO: # Image is wider
+        if current_aspect_ratio > TARGET_ASPECT_RATIO: 
             new_w = int(TARGET_ASPECT_RATIO * h)
             x_start = (w - new_w) // 2
             img = img[:, x_start:x_start + new_w]
-        else: # Image is taller
+        else: 
             new_h = int(w / TARGET_ASPECT_RATIO)
             y_start = (h - new_h) // 2
             img = img[y_start:y_start + new_h, :]
     
-    # 2. Scale down if larger than 800x600
     h, w, _ = img.shape
     if w > 800 or h > 600:
         img = cv2.resize(img, (800, 600), interpolation=cv2.INTER_AREA)
 
-    # 3. Discard if smaller than 800x600
     h, w, _ = img.shape
     if w < 800 or h < 600:
-        # print(f"Info: Discarding small image: {path} ({w}x{h})")
         return None
         
     return img
 
 def extract_features_from_image(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Extracts features from all 64 cells in a single BGR image.
-    Converts to grayscale internally for feature extraction.
+    Extracts an enhanced set of features from all 64 cells in a single BGR image.
     """
     gray_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    hsv_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    
     features_list = []
     
     for y in range(0, gray_img.shape[0], GRID_H):
         for x in range(0, gray_img.shape[1], GRID_W):
-            cell = gray_img[y:y+GRID_H, x:x+GRID_W]
             
-            # --- Feature Extraction Logic ---
+            # --- Get the cell for each image type ---
+            cell_gray = gray_img[y:y+GRID_H, x:x+GRID_W]
+            cell_hsv = hsv_img[y:y+GRID_H, x:x+GRID_W]
+            
             cell_features = []
-            # 1. Mean intensity
-            cell_features.append(np.mean(cell))
-            # 2. Standard deviation
-            cell_features.append(np.std(cell))
             
-            # 3. LBP Texture Histogram
-            lbp = local_binary_pattern(cell, LBP_POINTS, LBP_RADIUS, method="uniform")
+            # --- Feature Set 1: Grayscale Statistics (Original) ---
+            cell_features.append(np.mean(cell_gray))
+            cell_features.append(np.std(cell_gray))
+            
+            # --- Feature Set 2: LBP Texture (Original) ---
+            lbp = local_binary_pattern(cell_gray, LBP_POINTS, LBP_RADIUS, method="uniform")
             hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, LBP_POINTS + 3), density=True)
             cell_features.extend(hist)
             
-            # 4. Edge density
-            edges = cv2.Canny(cell, 50, 150)
-            cell_features.append(np.sum(edges > 0) / cell.size)
+            # --- Feature Set 3: Edge Density (Original) ---
+            edges = cv2.Canny(cell_gray, 50, 150)
+            cell_features.append(np.sum(edges > 0) / cell_gray.size)
+
+            # --- Feature Set 4: Color Statistics (NEW) ---
+            # Split HSV channels and get mean/std for each
+            h, s, v = cv2.split(cell_hsv)
+            cell_features.append(np.mean(h))
+            cell_features.append(np.std(h))
+            cell_features.append(np.mean(s))
+            cell_features.append(np.std(s))
+            cell_features.append(np.mean(v))
+            cell_features.append(np.std(v))
+
+            # --- Feature Set 5: Haralick Texture (NEW) ---
+            # Compute Gray-Level Co-occurrence Matrix (GLCM)
+            # Requires image to be uint8
+            glcm = graycomatrix(cell_gray, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+            
+            # Extract properties from GLCM
+            cell_features.append(graycoprops(glcm, 'contrast')[0, 0])
+            cell_features.append(graycoprops(glcm, 'dissimilarity')[0, 0])
+            cell_features.append(graycoprops(glcm, 'homogeneity')[0, 0])
+            cell_features.append(graycoprops(glcm, 'energy')[0, 0])
             
             features_list.append(np.array(cell_features))
             
@@ -123,10 +140,8 @@ def extract_features_from_image(img_bgr: np.ndarray) -> np.ndarray:
 def draw_grid_visualization(img: np.ndarray, grid_map: np.ndarray) -> np.ndarray:
     """
     Draws the visualization grid on the image.
-    Highlights anomalous cells (where grid_map == 1).
     """
     def apply_dither_effect(cell: np.ndarray) -> np.ndarray:
-        """Applies a semi-transparent overlay to anomalous cells."""
         h, w, _ = cell.shape
         overlay = np.zeros_like(cell, dtype=np.uint8)
         for y in range(0, h, 4):
@@ -140,13 +155,10 @@ def draw_grid_visualization(img: np.ndarray, grid_map: np.ndarray) -> np.ndarray
             y1, x1 = i * GRID_H, j * GRID_W
             y2, x2 = y1 + GRID_H, x1 + GRID_W
             
-            # Apply visual effect if anomaly (1)
             if grid_map[i, j] == 1:
                 img[y1:y2, x1:x2] = apply_dither_effect(img[y1:y2, x1:x2])
                 
-            # Draw grid rectangle
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 1)
-            # Draw cell number
             cv2.putText(img, str(cell_number), (x1 + 3, y1 + 15), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
             cell_number += 1
@@ -167,7 +179,6 @@ def run_training(args):
     
     if not image_paths:
         print(f"❌ Error: No images found in '{training_folder}'.")
-        print("Please add 'normal' (no wildlife) images to this folder to train the model.")
         return
 
     all_features = []
@@ -180,7 +191,6 @@ def run_training(args):
 
     if not all_features:
         print("❌ Error: No valid images found for training after processing.")
-        print("Please ensure your images are at least 800x600.")
         return
 
     X_train = np.vstack(all_features)
@@ -191,18 +201,40 @@ def run_training(args):
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     
-    # 2. Create and fit the Isolation Forest model
-    print("Training IsolationForest...")
-    # Contamination: The expected proportion of anomalies in the training data.
-    # Set this to a low value if you assume your training data is "clean".
-    iso_forest = IsolationForest(contamination=0.01, random_state=42, n_jobs=-1)
-    iso_forest.fit(X_train_scaled)
+    # === MODIFIED SECTION ===
+    # 2. Create and fit the chosen anomaly detection model
+    print(f"--- 💡 Training Model: {MODEL_TO_USE} ---")
+    
+    model = None
+    # Set a low contamination if you trust your training data is "clean"
+    contamination_level = 0.01 
+
+    if MODEL_TO_USE == 'iso_forest':
+        # Good all-rounder, fast.
+        model = IsolationForest(contamination=contamination_level, random_state=42, n_jobs=-1)
+    
+    elif MODEL_TO_USE == 'one_class_svm':
+        # Good for high-dimensional data, can be slow to train.
+        # 'nu' is similar to contamination.
+        model = OneClassSVM(nu=contamination_level, kernel="rbf", gamma="auto")
+        
+    elif MODEL_TO_USE == 'lof':
+        # Good at finding local anomalies, but must set novelty=True.
+        model = LocalOutlierFactor(n_neighbors=20, contamination=contamination_level, novelty=True)
+
+    else:
+        print(f"❌ Error: Unknown model '{MODEL_TO_USE}'.")
+        print("Please set MODEL_TO_USE to 'iso_forest', 'one_class_svm', or 'lof' at the top.")
+        return
+
+    model.fit(X_train_scaled)
+    # ==========================
     
     # 3. Save both models to a single pickle file
     models = {
         'scaler': scaler, 
-        'model': iso_forest,
-        'model_name': 'iso_forest'
+        'model': model, # Save the generic 'model' variable
+        'model_name': MODEL_TO_USE # Save the name
     }
     joblib.dump(models, MODEL_PATH)
     
@@ -212,17 +244,15 @@ def run_training(args):
 def run_prediction(args):
     """
     Executes the model prediction pipeline on a single image.
+    (This function is unchanged)
     """
     print("--- 🔍 Running Model Prediction ---")
     
-    # 1. Check for model
     if not os.path.exists(MODEL_PATH):
         print(f"❌ Error: Model file not found at '{MODEL_PATH}'.")
-        print("Please run the 'train' command first:")
-        print(f"  python {sys.argv[0]} train")
+        print(f"Please run: python {sys.argv[0]} train")
         return
 
-    # 2. Find image to predict
     image_path = args.image
     if image_path:
         if not os.path.exists(image_path):
@@ -230,7 +260,6 @@ def run_prediction(args):
             return
         print(f"--- Testing specified image: {image_path} ---")
     else:
-        # No specific image given, pick a random one
         if not os.path.isdir(DEFAULT_IMAGE_FOLDER):
             print(f"❌ Error: Default folder '{DEFAULT_IMAGE_FOLDER}' not found.")
             return
@@ -262,18 +291,13 @@ def run_prediction(args):
     preds = model.predict(features_scaled)
 
     # 6. Visualize and show the result
-    # Anomalies are -1. Map to 1 for anomaly, 0 for normal.
     grid_map = (preds == -1).astype(int).reshape((8, 8))
-    
-    # Draw on a copy of the BGR image
     final_image = draw_grid_visualization(processed_img.copy(), grid_map)
 
-    # Save the output for review
     output_filename = f"test_output_{os.path.basename(image_path)}"
     cv2.imwrite(output_filename, final_image)
     print(f"✅ Output saved to '{output_filename}'")
     
-    # Display in a window
     window_title = f"Test Result: {os.path.basename(image_path)} (Model: {model_name})"
     cv2.imshow(window_title, final_image)
     print("Press any key to close the image window.")
@@ -283,6 +307,7 @@ def run_prediction(args):
 def main():
     """
     Main entry point with command-line argument parsing.
+    (This function is unchanged)
     """
     parser = argparse.ArgumentParser(
         description="Wildlife Anomaly Detector - Train and Predict.",
@@ -309,7 +334,6 @@ def main():
     )
     predict_parser.set_defaults(func=run_prediction)
     
-    # Show help if no command is given
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
         sys.exit(1)
