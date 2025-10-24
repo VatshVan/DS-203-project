@@ -167,7 +167,7 @@ def extract_features_from_image(img_bgr: np.ndarray) -> np.ndarray:
             cell_features.extend([np.mean(sobelx), np.std(sobelx),
                                   np.mean(sobely), np.std(sobely),
                                   np.mean(magnitude), np.std(magnitude)])
-            
+
             # --- Feature Set 8: Hu Moments (NEW: 7 features) ---
             # 7 scale/rotation/translation-invariant shape descriptors
             moments = cv2.moments(cell_gray)
