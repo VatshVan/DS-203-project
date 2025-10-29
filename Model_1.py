@@ -179,7 +179,7 @@ def extract_features_from_image(img_bgr: np.ndarray) -> np.ndarray:
             
             # --- Total: 2+10+1+48+24+16+6+7 = 114 features ---
             features_list.append(np.array(cell_features))
-            
+
     return np.vstack(features_list)
 
 def draw_grid_visualization(img: np.ndarray, grid_map: np.ndarray) -> np.ndarray:
