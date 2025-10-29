@@ -1,136 +1,164 @@
-import os
 import cv2
 import numpy as np
-from skimage.feature import local_binary_pattern
-import joblib
 import glob
+import os
+import joblib
+from skimage.feature import hog
+from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
-from sklearn.svm import OneClassSVM
-from sklearn.neighbors import LocalOutlierFactor
+from sklearn.exceptions import NotFittedError
+# --- NEW IMPORT ---
+from sklearn.metrics import classification_report
 
-# --- Configuration ---
-GRID_W = 100
-GRID_H = 75
-TARGET_ASPECT_RATIO = 4.0 / 3.0
-LBP_RADIUS = 1
-LBP_POINTS = 8 * LBP_RADIUS
-MODEL_PATH = "wildlife_detector_model.pkl"
-TRAINING_IMAGE_FOLDER = "images" # <-- Folder with *only normal* images
+# --- 1. Define Constants ---
+TARGET_W, TARGET_H = 800, 600
+TARGET_ASPECT_RATIO = TARGET_W / TARGET_H
+GRID_ROWS, GRID_COLS = 8, 8
+GRID_W = TARGET_W // GRID_COLS  # 100
+GRID_H = TARGET_H // GRID_ROWS  # 75
+IMAGE_DIR = "images"
+LABEL_DIR = "labels"
 
-# --- Helper Functions (Copied from your script) ---
-
-def process_image_for_training(path: str) -> np.ndarray | None:
-    """Loads and processes an image using the same rules as training."""
+# --- 2. Copy Your process_image Helper Function ---
+def process_image(path: str) -> np.ndarray | None:
+    """
+    Loads an image, enforces 4:3 aspect ratio by center-cropping,
+    and resizes to exactly 800x600.
+    """
     img = cv2.imread(path)
-    if img is None: return None
+    if img is None:
+        print(f"Warning: Could not read image at {path}")
+        return None
     h, w, _ = img.shape
     current_aspect_ratio = w / h
     if not np.isclose(current_aspect_ratio, TARGET_ASPECT_RATIO):
-        if current_aspect_ratio > TARGET_ASPECT_RATIO:
+        if current_aspect_ratio > TARGET_ASPECT_RATIO: 
             new_w = int(TARGET_ASPECT_RATIO * h)
             x_start = (w - new_w) // 2
             img = img[:, x_start:x_start + new_w]
-        else:
+        else: 
             new_h = int(w / TARGET_ASPECT_RATIO)
             y_start = (h - new_h) // 2
             img = img[y_start:y_start + new_h, :]
     h, w, _ = img.shape
-    if w > 800 or h > 600:
-        img = cv2.resize(img, (800, 600), interpolation=cv2.INTER_AREA)
-    h, w, _ = img.shape
-    if w < 800 or h < 600: return None
+    if w > TARGET_W:
+        interpolation = cv2.INTER_AREA
+    else:
+        interpolation = cv2.INTER_CUBIC
+    img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=interpolation)
     return img
 
-def extract_features_from_image(img: np.ndarray) -> np.ndarray:
-    """Extracts features from all 64 cells in a single image."""
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    features_list = []
-    for y in range(0, gray_img.shape[0], GRID_H):
-        for x in range(0, gray_img.shape[1], GRID_W):
-            cell = gray_img[y:y+GRID_H, x:x+GRID_W]
-            cell_features = []
-            cell_features.append(np.mean(cell))
-            cell_features.append(np.std(cell))
-            lbp = local_binary_pattern(cell, LBP_POINTS, LBP_RADIUS, method="uniform")
-            hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, LBP_POINTS + 3), density=True)
-            cell_features.extend(hist)
-            edges = cv2.Canny(cell, 50, 150)
-            cell_features.append(np.sum(edges > 0) / cell.size)
-            features_list.append(np.array(cell_features))
-    return np.vstack(features_list)
+# --- 3. Feature Extraction and Data Loading ---
+def extract_cell_features(cell_image: np.ndarray) -> np.ndarray:
+    """
+    Extracts HOG features from a single 100x75 cell.
+    Converts to grayscale first, as HOG requires it.
+    """
+    gray_cell = cv2.cvtColor(cell_image, cv2.COLOR_BGR2GRAY)
+    
+    features = hog(gray_cell, orientations=9, pixels_per_cell=(8, 8),
+                   cells_per_block=(2, 2), block_norm='L2-Hys', 
+                   visualize=False, transform_sqrt=True)
+    return features
 
-# --- Main Training Execution ---
-if __name__ == "__main__":
+def load_data():
+    """
+    Loads all labeled data, extracting HOG features and labels
+    for every single grid cell.
+    """
+    print("Loading labeled data and extracting features...")
+    X_features = []  # To store HOG feature vectors
+    y_labels = []    # To store labels (0 or 1)
     
-    # 1. Select the model you want to train
-    # Options: 'iso_forest', 'one_class_svm', 'lof'
-    CHOSEN_MODEL_NAME = 'iso_forest' 
-    
-    # 2. Find all training images
-    image_paths = glob.glob(os.path.join(TRAINING_IMAGE_FOLDER, "*.jpg"))
-    image_paths.extend(glob.glob(os.path.join(TRAINING_IMAGE_FOLDER, "*.png")))
-    
-    if not image_paths:
-        print(f"Error: No images found in '{TRAINING_IMAGE_FOLDER}'.")
-        print("Please create this folder and add 'normal' (no wildlife) images to it.")
-    else:
-        print(f"Found {len(image_paths)} training images. Extracting features...")
+    label_paths = glob.glob(os.path.join(LABEL_DIR, "*.npy"))
+    if not label_paths:
+        return None, None
+
+    for label_path in label_paths:
+        basename = os.path.basename(label_path).replace(".npy", "")
+        img_path = None
+        for ext in ("*.jpg", "*.jpeg", "*.png"):
+            potential_path = glob.glob(os.path.join(IMAGE_DIR, f"{basename}{ext[1:]}"))
+            if potential_path:
+                img_path = potential_path[0]
+                break
         
-        # 3. Extract features from all training images
-        all_features = []
-        for path in image_paths:
-            img = process_image_for_training(path)
-            if img is not None:
-                features = extract_features_from_image(img)
-                all_features.append(features)
-            else:
-                print(f"Skipping {path} (size/aspect issue)")
-        
-        if not all_features:
-            print("No valid training images were processed. Exiting.")
-            exit()
+        if not img_path:
+            continue
+
+        img = process_image(img_path)
+        if img is None:
+            continue
             
-        X_train = np.vstack(all_features)
-        print(f"Total features extracted for training: {X_train.shape[0]}")
+        grid_map = np.load(label_path) # The 8x8 label map
         
-        # 4. Scale the features
+        for i in range(GRID_ROWS):
+            for j in range(GRID_COLS):
+                y1, x1 = i * GRID_H, j * GRID_W
+                y2, x2 = y1 + GRID_H, x1 + GRID_W
+                cell_patch = img[y1:y2, x1:x2]
+                
+                features = extract_cell_features(cell_patch)
+                
+                X_features.append(features)
+                y_labels.append(grid_map[i, j])
+
+    if not X_features:
+        return None, None
+
+    print(f"Loaded {len(y_labels)} cell examples from {len(label_paths)} images.")
+    return np.array(X_features), np.array(y_labels)
+
+# --- 4. Main Training Logic ---
+if __name__ == "__main__":
+    X_train, y_train = load_data()
+    
+    if X_train is None:
+        print("Error: No labels found in the 'labels' directory.")
+        print("Please label 10-20 images with `wildlife_labeler.py` first.")
+    else:
+        # --- 1. Scale the features ---
+        print("Scaling features...")
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         
-        # 5. Define and train the chosen model
-        model = None
+        # --- 2. Train the SVM ---
+        print("Training SVM model...")
+        model = SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced')
         
-        if CHOSEN_MODEL_NAME == 'iso_forest':
-            print("Training IsolationForest...")
-            # contamination: The expected proportion of anomalies in the *training* data.
-            # Since we assume training data is "clean", we set this very low.
-            model = IsolationForest(contamination=0.001, random_state=42, n_estimators=100)
+        model.fit(X_train_scaled, y_train)
         
-        elif CHOSEN_MODEL_NAME == 'one_class_svm':
-            print("Training OneClassSVM...")
-            # nu: An upper bound on the fraction of training errors and a lower
-            # bound of the fraction of support vectors. (Similar to contamination)
-            model = OneClassSVM(nu=0.001, kernel="rbf", gamma="auto")
-            
-        elif CHOSEN_MODEL_NAME == 'lof':
-            print("Training LocalOutlierFactor...")
-            # novelty=True: This is crucial! It allows the LOF model to be
-            # used for predicting on *new*, unseen data.
-            model = LocalOutlierFactor(n_neighbors=20, contamination=0.001, novelty=True)
+        print("Training complete.")
         
-        else:
-            print(f"Error: Unknown model '{CHOSEN_MODEL_NAME}'.")
-            exit()
+        # --- 3. Evaluate Model and Save Output --- (THIS IS THE NEW SECTION)
+        print("\n--- Evaluating model on training data ---")
+        
+        # Use the trained model to predict on the same data
+        y_pred = model.predict(X_train_scaled)
+        
+        # Generate the text report
+        report = classification_report(y_train, y_pred, target_names=["No Animal (0)", "Animal (1)"], zero_division=0)
+        
+        print(report)
+        
+        # Save the report to a file
+        OUTPUT_FILE = "model_training_report.txt"
+        try:
+            with open(OUTPUT_FILE, 'w') as f:
+                f.write("--- SVM Model Training Report ---\n\n")
+                f.write(f"Total cell examples trained on: {len(y_train)}\n")
+                f.write(f"Positive (Animal) samples: {np.sum(y_train)}\n")
+                f.write(f"Negative (No Animal) samples: {len(y_train) - np.sum(y_train)}\n\n")
+                f.write("--- Classification Report ---\n")
+                f.write(report)
+            print(f"--- Model output report saved to {OUTPUT_FILE} ---")
+        except IOError as e:
+            print(f"Warning: Could not save report. {e}")
 
-        model.fit(X_train_scaled)
+        # --- 4. Save the model AND the scaler ---
+        print("\n--- Saving model files ---")
+        joblib.dump(model, "wildlife_svm.joblib")
+        joblib.dump(scaler, "scaler.joblib")
         
-        # 6. Save the scaler and the trained model
-        print(f"Training complete. Saving model to '{MODEL_PATH}'...")
-        model_data = {
-            'scaler': scaler,
-            'model': model,
-            'model_name': CHOSEN_MODEL_NAME
-        }
-        joblib.dump(model_data, MODEL_PATH)
-        print("Done.")
+        print("--- Model saved as wildlife_svm.joblib ---")
+        print("--- Scaler saved as scaler.joblib ---")

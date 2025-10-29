@@ -1,0 +1,15 @@
+--- SVM Model Training Report ---
+
+Total cell examples trained on: 2688
+Positive (Animal) samples: 677
+Negative (No Animal) samples: 2011
+
+--- Classification Report ---
+               precision    recall  f1-score   support
+
+No Animal (0)       1.00      0.98      0.99      2011
+   Animal (1)       0.95      0.99      0.97       677
+
+     accuracy                           0.99      2688
+    macro avg       0.97      0.99      0.98      2688
+ weighted avg       0.99      0.99      0.99      2688
